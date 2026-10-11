@@ -257,11 +257,20 @@ a{color:inherit;}
       </div>
     </div>
     <div class="content" id="content"></div>
+    <div id="cameraContainer" style="display:none; position:fixed; top:20px; right:20px; width:320px; height:240px; border:3px solid var(--navy-900); border-radius:var(--radius-m); overflow:hidden; z-index:1000; box-shadow:var(--shadow-2); background:#000;">
+      <video id="cameraStream" style="width:100%; height:100%; object-fit:cover;" autoplay playsinline></video>
+      <canvas id="boxCanvas" style="position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none;"></canvas>
+    </div>
+    <div id="debugLog" style="position:fixed; bottom:10px; left:10px; background:rgba(0,0,0,0.8); color:#0f0; font-family:monospace; font-size:11px; padding:10px; border-radius:5px; z-index:1001; max-width:300px; max-height:200px; overflow-y:auto; pointer-events:none;">
+      System logs will appear here...
+    </div>
+    <canvas id="captureCanvas" style="display:none;"></canvas>
   </div>
 </div>
 
 <script>
 const API_BASE = window.location.origin + '/api';
+const AI_BASE = 'http://localhost:8000'; // Local AI server address
 
 const state = {
   screen: 'dashboard',
@@ -274,10 +283,142 @@ const state = {
     distance: 0,
     elapsedSec: 0,
     detections: [],
-    rc: { connected: false }
+    rc: { connected: false },
+    streamActive: false
   },
   reportOpenId: null
 };
+
+function log(msg) {
+  console.log('[Debug]', msg);
+  const logger = document.getElementById('debugLog');
+  if (logger) {
+    const line = document.createElement('div');
+    line.textContent = `> ${new Date().toLocaleTimeString()}: ${msg}`;
+    logger.appendChild(line);
+    logger.scrollTop = logger.scrollHeight;
+  }
+}
+
+async function startCamera() {
+  log('Attempting to start camera...');
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+    log('Camera stream acquired!');
+    const video = document.getElementById('cameraStream');
+    const container = document.getElementById('cameraContainer');
+    video.srcObject = stream;
+    container.style.display = 'block';
+    state.live.streamActive = true;
+
+    log('Starting inference loop...');
+    inferenceLoop();
+  } catch (err) {
+    log('ERROR: ' + err.message);
+    console.error('Camera access denied:', err);
+    alert('Camera access is required: ' + err.message);
+  }
+}
+
+async function stopCamera() {
+  log('Stopping camera...');
+  const video = document.getElementById('cameraStream');
+  const container = document.getElementById('cameraContainer');
+  if (video.srcObject) {
+    video.srcObject.getTracks().forEach(track => track.stop());
+    video.srcObject = null;
+  }
+  container.style.display = 'none';
+  state.live.streamActive = false;
+}
+
+async function inferenceLoop() {
+  if (!state.live.streamActive) return;
+
+  const video = document.getElementById('cameraStream');
+  const canvas = document.getElementById('captureCanvas');
+  const boxCanvas = document.getElementById('boxCanvas');
+  const boxCtx = boxCanvas.getContext('2d');
+  const context = canvas.getContext('2d');
+
+  if (video.paused || video.ended) {
+    log('Video paused or ended, skipping frame');
+    setTimeout(inferenceLoop, 1000);
+    return;
+  }
+
+  canvas.width = video.videoWidth || 640;
+  canvas.height = video.videoHeight || 480;
+  boxCanvas.width = boxCanvas.clientWidth;
+  boxCanvas.height = boxCanvas.clientHeight;
+
+  context.drawImage(video, 0, 0, canvas.width, canvas.height);
+  const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.8));
+
+  if (blob) {
+    const formData = new FormData();
+    formData.append('file', blob, 'frame.jpg');
+
+    try {
+      log('Sending frame to AI...');
+      const res = await fetch(`${AI_BASE}/predict`, {
+        method: 'POST',
+        body: formData,
+        mode: 'cors'
+      });
+
+      if (!res.ok) {
+        throw new Error(`Server responded with ${res.status}`);
+      }
+
+      const data = await res.json();
+      log(`AI Response received: ${data.detections ? data.detections.length : 0} detections`);
+
+      boxCtx.clearRect(0, 0, boxCanvas.width, boxCanvas.height);
+
+      if (data.detections) {
+        for (const det of data.detections) {
+          if (det.bbox) {
+            const [x1, y1, x2, y2] = det.bbox;
+            const scaleX = boxCanvas.width / canvas.width;
+            const scaleY = boxCanvas.height / canvas.height;
+            boxCtx.strokeStyle = det.severity === 'high' ? '#C23B32' : '#D9A233';
+            boxCtx.lineWidth = 3;
+            boxCtx.strokeRect(x1 * scaleX, y1 * scaleY, (x2 - x1) * scaleX, (y2 - y1) * scaleY);
+            boxCtx.fillStyle = boxCtx.strokeStyle;
+            boxCtx.font = 'bold 14px IBM Plex Sans';
+            boxCtx.fillText(`${det.type} ${det.confidence}%`, x1 * scaleX, (y1 * scaleY) - 5);
+          }
+
+          const isDuplicate = state.live.detections.some(d =>
+            d.type === det.type && Math.abs(d.conf - det.confidence) < 5
+          );
+
+          if (!isDuplicate) {
+            const newDet = {
+              type: det.type,
+              sev: det.severity,
+              chainage: state.live.chainage,
+              conf: det.confidence
+            };
+            state.live.detections.push(newDet);
+            fetch(`${API_BASE}/inspections/${state.live.inspectionId}/detections`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(newDet)
+            });
+          }
+        }
+        render();
+      }
+    } catch (err) {
+      log('NETWORK ERROR: ' + err.message);
+      console.error('Inference loop error:', err);
+    }
+  }
+
+  setTimeout(inferenceLoop, 1000);
+}
 
 async function loadStats() {
   try {
@@ -337,7 +478,7 @@ async function completeInspection(inspectionId, defects) {
 function handleButtonClick(btn) {
   const action = btn.getAttribute('data-action');
   const screen = btn.getAttribute('data-screen');
-  
+
   if (screen) {
     state.screen = screen;
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
@@ -354,18 +495,26 @@ function handleButtonClick(btn) {
       render();
     }
   } else if (action === 'beginInspection') {
+    log('Begin Inspection clicked');
     createInspection().then(result => {
       if (result && result.id) {
+        log('Inspection created: ' + result.id);
         state.live.inspectionId = result.id;
         state.screen = 'monitor';
         document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
         document.querySelector('[data-screen="monitor"]').classList.add('active');
         document.getElementById('monitorBtn').disabled = false;
+
+        if (state.mode === 'autonomous') {
+          startCamera();
+        }
+
         render();
       }
     });
   } else if (action === 'stopInspection') {
     if (state.live.inspectionId) {
+      stopCamera();
       const defects = { 'Crack': state.live.detections.length, 'Wear': 2 };
       completeInspection(state.live.inspectionId, defects).then(() => {
         state.live.inspectionId = null;
