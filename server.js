@@ -209,6 +209,18 @@ app.get('/api/health', (req, res) => {
 
 // Start server
 const PORT = process.env.PORT || 3000;
+app.post('/predict', express.raw({ type: '*/*', limit: '20mb' }), async (req, res) => {
+  try {
+    const r = await fetch('http://localhost:8000/predict', {
+      method: 'POST',
+      headers: { 'content-type': req.headers['content-type'] },
+      body: req.body,
+    });
+    res.status(r.status).type('json').send(await r.text());
+  } catch (e) {
+    res.status(502).json({ error: String(e) });
+  }
+});
 app.listen(PORT, () => {
   console.log(`TrackSense backend running on port ${PORT}`);
 });
