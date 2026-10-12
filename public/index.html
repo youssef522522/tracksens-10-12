@@ -270,7 +270,23 @@ a{color:inherit;}
 
 <script>
 const API_BASE = window.location.origin + '/api';
-const AI_BASE = "";; // Local AI server address
+// --- In-browser detection (onnxruntime-web, see detector.js + best.onnx) ---
+let detectorPromise = null;
+function getDetector() {
+  if (!detectorPromise) {
+    detectorPromise = import('./detector.js').then(async (m) => {
+      await m.loadModel('./best.onnx');
+      return m;
+    });
+    detectorPromise.catch(() => { detectorPromise = null; }); // allow retry
+  }
+  return detectorPromise;
+}
+
+// PLACEHOLDER severity rule (the old Python server decided this): adjust to taste.
+function severityFor(det) {
+  return det.score >= 0.6 ? 'high' : 'medium';
+}
 
 const state = {
   screen: 'dashboard',
@@ -311,12 +327,22 @@ async function startCamera() {
     container.style.display = 'block';
     state.live.streamActive = true;
 
-    log('Starting inference loop...');
-    inferenceLoop();
   } catch (err) {
     log('ERROR: ' + err.message);
     console.error('Camera access denied:', err);
     alert('Camera access is required: ' + err.message);
+    return;
+  }
+
+  try {
+    log('Loading AI model...');
+    await getDetector();
+    log('Model ready. Starting inference loop...');
+    inferenceLoop();
+  } catch (err) {
+    log('MODEL ERROR: ' + err.message);
+    console.error('Model load failed:', err);
+    alert('Could not load the detection model: ' + err.message);
   }
 }
 
@@ -336,88 +362,74 @@ async function inferenceLoop() {
   if (!state.live.streamActive) return;
 
   const video = document.getElementById('cameraStream');
-  const canvas = document.getElementById('captureCanvas');
   const boxCanvas = document.getElementById('boxCanvas');
   const boxCtx = boxCanvas.getContext('2d');
-  const context = canvas.getContext('2d');
 
-  if (video.paused || video.ended) {
-    log('Video paused or ended, skipping frame');
-    setTimeout(inferenceLoop, 1000);
+  if (video.paused || video.ended || !video.videoWidth) {
+    setTimeout(inferenceLoop, 500);
     return;
   }
 
-  canvas.width = video.videoWidth || 640;
-  canvas.height = video.videoHeight || 480;
   boxCanvas.width = boxCanvas.clientWidth;
   boxCanvas.height = boxCanvas.clientHeight;
 
-  context.drawImage(video, 0, 0, canvas.width, canvas.height);
-  const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.8));
+  try {
+    const { detect } = await getDetector();
+    const raw = await detect(video, { conf: 0.25, iou: 0.45 });
+    if (!state.live.streamActive) return; // stopped while inferring
 
-  if (blob) {
-    const formData = new FormData();
-    formData.append('file', blob, 'frame.jpg');
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    const scaleX = boxCanvas.width / vw;
+    const scaleY = boxCanvas.height / vh;
+    let added = false;
 
-    try {
-      log('Sending frame to AI...');
-      const res = await fetch(`${AI_BASE}/predict`, {
-        method: 'POST',
-        body: formData,
-        mode: 'cors'
-      });
+    boxCtx.clearRect(0, 0, boxCanvas.width, boxCanvas.height);
 
-      if (!res.ok) {
-        throw new Error(`Server responded with ${res.status}`);
+    for (const r of raw) {
+      const det = {
+        type: r.label,
+        severity: severityFor(r),
+        confidence: Math.round(r.score * 100),
+        bbox: [r.x1, r.y1, r.x2, r.y2]
+      };
+
+      const [x1, y1, x2, y2] = det.bbox;
+      boxCtx.strokeStyle = det.severity === 'high' ? '#C23B32' : '#D9A233';
+      boxCtx.lineWidth = 3;
+      boxCtx.strokeRect(x1 * scaleX, y1 * scaleY, (x2 - x1) * scaleX, (y2 - y1) * scaleY);
+      boxCtx.fillStyle = boxCtx.strokeStyle;
+      boxCtx.font = 'bold 14px IBM Plex Sans';
+      boxCtx.fillText(`${det.type} ${det.confidence}%`, x1 * scaleX, (y1 * scaleY) - 5);
+
+      const isDuplicate = state.live.detections.some(d =>
+        d.type === det.type && Math.abs(d.conf - det.confidence) < 5
+      );
+
+      if (!isDuplicate) {
+        const newDet = {
+          type: det.type,
+          sev: det.severity,
+          chainage: state.live.chainage,
+          conf: det.confidence
+        };
+        state.live.detections.push(newDet);
+        added = true;
+        // Save to backend if one exists; ignore failures (e.g. static Cloudflare hosting)
+        fetch(`${API_BASE}/inspections/${state.live.inspectionId}/detections`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(newDet)
+        }).catch(() => {});
       }
-
-      const data = await res.json();
-      log(`AI Response received: ${data.detections ? data.detections.length : 0} detections`);
-
-      boxCtx.clearRect(0, 0, boxCanvas.width, boxCanvas.height);
-
-      if (data.detections) {
-        for (const det of data.detections) {
-          if (det.bbox) {
-            const [x1, y1, x2, y2] = det.bbox;
-            const scaleX = boxCanvas.width / canvas.width;
-            const scaleY = boxCanvas.height / canvas.height;
-            boxCtx.strokeStyle = det.severity === 'high' ? '#C23B32' : '#D9A233';
-            boxCtx.lineWidth = 3;
-            boxCtx.strokeRect(x1 * scaleX, y1 * scaleY, (x2 - x1) * scaleX, (y2 - y1) * scaleY);
-            boxCtx.fillStyle = boxCtx.strokeStyle;
-            boxCtx.font = 'bold 14px IBM Plex Sans';
-            boxCtx.fillText(`${det.type} ${det.confidence}%`, x1 * scaleX, (y1 * scaleY) - 5);
-          }
-
-          const isDuplicate = state.live.detections.some(d =>
-            d.type === det.type && Math.abs(d.conf - det.confidence) < 5
-          );
-
-          if (!isDuplicate) {
-            const newDet = {
-              type: det.type,
-              sev: det.severity,
-              chainage: state.live.chainage,
-              conf: det.confidence
-            };
-            state.live.detections.push(newDet);
-            fetch(`${API_BASE}/inspections/${state.live.inspectionId}/detections`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(newDet)
-            });
-          }
-        }
-        render();
-      }
-    } catch (err) {
-      log('NETWORK ERROR: ' + err.message);
-      console.error('Inference loop error:', err);
     }
+    if (added) render();
+  } catch (err) {
+    log('INFERENCE ERROR: ' + err.message);
+    console.error('Inference loop error:', err);
   }
 
-  setTimeout(inferenceLoop, 1000);
+  setTimeout(inferenceLoop, 300);
 }
 
 async function loadStats() {
@@ -453,9 +465,15 @@ async function createInspection() {
         targetDistance: state.cfg.targetDistance
       })
     });
-    return await res.json();
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const created = await res.json();
+    if (!created || !created.id) throw new Error('Unexpected response');
+    return created;
   } catch (err) {
-    console.error('Failed to create inspection:', err);
+    // No backend (e.g. static Cloudflare Pages): continue in local-only mode
+    console.warn('Backend unavailable, running without saving:', err);
+    log('Backend unavailable - local-only mode');
+    return { id };
   }
 }
 
