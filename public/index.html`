@@ -267,7 +267,7 @@ a{color:inherit;}
 
 <script>
 const API_BASE = window.location.origin + '/api';
-const AI_BASE = 'http://localhost:8000'; // Local AI server address
+const AI_BASE = 'https://sense-personally-abroad-oscar.trycloudflare.com'; // Local AI server address
 
 const state = {
   screen: 'dashboard',

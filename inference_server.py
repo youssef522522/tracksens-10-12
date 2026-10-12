@@ -79,5 +79,5 @@ async def predict(file: UploadFile = File(...)):
 
 if __name__ == "__main__":
     import uvicorn
-    print("Starting server on http://localhost:8000")
+    print("Starting server on http://https://sense-personally-abroad-oscar.trycloudflare.com")
     uvicorn.run(app, host="0.0.0.0", port=8000)
